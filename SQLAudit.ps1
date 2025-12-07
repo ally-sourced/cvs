@@ -1,7 +1,7 @@
 # PowerShell script to review Azure SQL configurations
 
 # Ensure login
-az login
+#az login
 
 # Output directory for results
 $output_dir = ".\AzureSQLReview"
@@ -18,12 +18,17 @@ foreach ($subscription in $subscriptions) {
     # Set subscription context
     az account set --subscription "$subscription_id"
 
-    # Get SQL servers
-    $sql_servers = az sql server list --query "[].{name:name, resourceGroup:resourceGroupName}" -o json | ConvertFrom-Json
+    # Get SQL servers in the current subscription
+    $sql_servers = az sql server list --query "[].{name:name, resourceGroup:resourceGroup}" -o json | ConvertFrom-Json
 
     foreach ($server in $sql_servers) {
         $server_name = $server.name
-        $resource_group = $server.resourceGroup 
+        $resource_group = $server.resourceGroup
+        
+        if (-not $resource_group) {
+            Write-Host "Warning: Resource group for server $server_name not found."
+            continue
+        }
         
         # Get databases in the current SQL server
         $sql_databases = az sql db list --server "$server_name" --resource-group "$resource_group" --query "[].{name:name}" -o json | ConvertFrom-Json
@@ -41,13 +46,15 @@ foreach ($subscription in $subscriptions) {
 
             # Data Protection
             $tde_status = az sql db show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "transparentDataEncryption.status" -o json
-            $always_encrypted = az sql db encryption show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "columnEncryption" -o json
+            
+            # Check if any columns are encrypted (Always Encrypted)
+            $encrypted_columns = az sql db show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "encryptionProtector" -o json
 
             # Auditing and Monitoring
             $auditing = az sql db audit-policy show --name "$db_name" --server "$server_name" --resource-group "$resource_group" -o json
 
             # Append results to output files
-            $result_entry = "$subscription_name,$resource_group,$server_name,$db_name,AAD:$aad_auth,Users:$users,Firewalls:$firewalls,VNet:$vnet_service_endpoint,TDE:$tde_status,Always Encrypted:$always_encrypted,Auditing:$auditing"
+            $result_entry = "$subscription_name,$resource_group,$server_name,$db_name,AAD:$aad_auth,Users:$users,Firewalls:$firewalls,VNet:$vnet_service_endpoint,TDE:$tde_status,Encrypted Columns:$encrypted_columns,Auditing:$auditing"
             Add-Content -Path "$output_dir\$subscription_name_SQL_Report.csv" -Value $result_entry
         }
     }
