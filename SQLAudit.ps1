@@ -1,68 +1,55 @@
-# Ensure you are logged in and have the necessary permissions
+# PowerShell script to review Azure SQL configuration
+
+# Ensure login
 az login
 
-# Create output directory
-$outputDir = ".\AzureSQLReview"
-if (!(Test-Path -Path $outputDir)) {
-    New-Item -ItemType Directory -Path $outputDir
-}
+# Output directory for results
+$output_dir = ".\AzureSQLReview"
+New-Item -ItemType Directory -Force -Path $output_dir
 
 # Get all subscriptions
 $subscriptions = az account list --query "[].{name:name, id:id}" -o json | ConvertFrom-Json
 
-# Initialize control results hashtable
-$controlResults = @{}
-
-# Define control types
-$controlTypes = @("Authentication and Access Control", "Network Security", "Data Protection", "Auditing and Monitoring", "Configuration Management")
-
-# Iterate through each subscription
+# Iterate through subscriptions
 foreach ($subscription in $subscriptions) {
-    $subscriptionName = $subscription.name
-    $subscriptionId = $subscription.id
+    $subscription_name = $subscription.name
+    $subscription_id = $subscription.id
 
     # Set subscription context
-    az account set --subscription $subscriptionId
+    az account set --subscription "$subscription_id"
 
-    # Get SQL servers in the current subscription
-    $sqlServers = az sql server list --query "[].{name:name, resourceGroup:resourceGroupName}" -o json | ConvertFrom-Json
+    # Get SQL servers
+    $sql_servers = az sql server list --query "[].{name:name, resourceGroup:resourceGroupName, adminLogin:administratorLogin}" -o json | ConvertFrom-Json
 
-    foreach ($server in $sqlServers) {
-        $serverName = $server.name
-        $resourceGroup = $server.resourceGroup
+    foreach ($server in $sql_servers) {
+        $server_name = $server.name
+        $resource_group = $server.resourceGroup
         
-        # Check databases in the current SQL server
-        $sqlDatabases = az sql db list --server $serverName --resource-group $resourceGroup --query "[].{name:name}" -o json | ConvertFrom-Json
+        # Get databases
+        $sql_databases = az sql db list --server "$server_name" --resource-group "$resource_group" --query "[].{name:name}" -o json | ConvertFrom-Json
 
-        foreach ($db in $sqlDatabases) {
-            $dbName = $db.name
+        foreach ($db in $sql_databases) {
+            $db_name = $db.name
 
             # Authentication and Access Control
-            $aadAuth = az sql db show --name $dbName --server $serverName --resource-group $resourceGroup --query "identity" -o json
-            $controlResults["Authentication and Access Control"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, AAD Integration: $aadAuth"
-
-            # User and Role Management
-            $users = az sql db list-usages --name $dbName --server $serverName --resource-group $resourceGroup --query "[]" -o json
-            $controlResults["Authentication and Access Control"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, Users: $users"
+            $aad_auth = az sql db show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "identity" -o json
+            $users = az sql db list-usages --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "[]"
 
             # Network Security
-            $firewalls = az sql db show --resource-group $resourceGroup --server $serverName --name $dbName --query "firewallRules" -o json
-            $controlResults["Network Security"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, Firewall Rules: $firewalls"
-
-            $vnetServiceEndpoint = az sql db show --name $dbName --server $serverName --resource-group $resourceGroup --query "virtualNetworkRules" -o json
-            $controlResults["Network Security"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, VNet Service Endpoint: $vnetServiceEndpoint"
+            $firewalls = az sql db show --resource-group "$resource_group" --server "$server_name" --name "$db_name" --query "firewallRules" -o json
+            $vnet_service_endpoint = az sql db show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "virtualNetworkRules" -o json
 
             # Data Protection
-            $tdeStatus = az sql db show --name $dbName --server $serverName --resource-group $resourceGroup --query "transparentDataEncryption.status" -o json
-            $controlResults["Data Protection"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, TDE Status: $tdeStatus"
-
-            $alwaysEncrypted = az sql db encryption show --name $dbName --server $serverName --resource-group $resourceGroup --query "columnEncryption" -o json
-            $controlResults["Data Protection"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, Always Encrypted: $alwaysEncrypted"
+            $tde_status = az sql db show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "transparentDataEncryption.status" -o json
+            $always_encrypted = az sql db encryption show --name "$db_name" --server "$server_name" --resource-group "$resource_group" --query "columnEncryption" -o json
 
             # Auditing and Monitoring
-            $auditing = az sql db audit-policy list --name $dbName --server $serverName --resource-group $resourceGroup -o json
-            $controlResults["Auditing and Monitoring"] += "$subscriptionName, $resourceGroup, $serverName, $dbName, Auditing: $auditing"
+            $auditing = az sql db audit-policy list --name "$db_name" --server "$server_name" --resource-group "$resource_group" -o json
 
-            # Advanced Threat Protection
-            $threatProtection = az sql db threat-policy show --name $dbName --server $serverName --resource-group $resourceGroup -o json
-            $controlResults["Auditing and Monitoring"] += "$subscriptionName, $resourceGroup, $serverName, $
+            # Append results to output files
+            Add-Content -Path "$output_dir\$subscription_name_SQL_Report.csv" -Value "$subscription_name, $resource_group, $server_name, $db_name, AAD: $aad_auth, Users: $users, Firewalls: $firewalls, VNet: $vnet_service_endpoint, TDE: $tde_status, Always Encrypted: $always_encrypted, Auditing: $auditing"
+        }
+    }
+}
+
+Write-Host "Review completed. Results are saved in the AzureSQLReview directory."
