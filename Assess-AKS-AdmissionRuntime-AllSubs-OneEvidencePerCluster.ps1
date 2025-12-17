@@ -1,26 +1,17 @@
 <#
-Assess AKS admission control + container runtime protections across ALL Azure subscriptions.
+PowerShell 5.1 compatible AKS admission/runtime assessment across ALL Azure subscriptions.
 
 Outputs:
-1) One consolidated CSV across all subscriptions/clusters
-2) Per-cluster evidence folder containing:
-   - evidence.json (full fidelity)
-   - evidence_summary.json (optional, flattened / CSV-friendly)
-
-What it detects:
-- Azure Policy add-on enabled (ARM)
-- Azure Policy assignments at subscription/RG/cluster scopes (ARM)
-- Gatekeeper presence + constraints/templates + webhook configs (in-cluster)
-- Azure Policy ↔ Gatekeeper mapping via constraint annotations that include policyAssignment IDs (best-effort)
-- ACR-only pull patterns (Gatekeeper constraint content + Kyverno content: azurecr.io / *.azurecr.io)
-- PSA enforcement via namespace labels (pod-security.kubernetes.io/enforce)
-- Kyverno presence + ClusterPolicies/Policies + image-related hints (in-cluster)
-- Defender for Cloud pricing tiers (subscription-level; KubernetesService/ContainerRegistry)
+- Consolidated CSV (one row per AKS cluster)
+- Per cluster:
+  evidence.json (full)
+  evidence_summary.json (optional flattened)
 
 Prereqs:
-- Azure CLI installed and logged in: az login
-- Permission to list subs and read AKS: Microsoft.ContainerService/managedClusters/read
-- Permission to run in-cluster queries: az aks command invoke (or equivalent)
+- az login
+- az cli installed
+- rights to read AKS + policy assignments
+- rights for az aks command invoke (for in-cluster data)
 #>
 
 Set-StrictMode -Version Latest
@@ -32,7 +23,7 @@ $RootOut   = Join-Path (Get-Location) "aks_assessment_$Timestamp"
 $EvidenceRoot = Join-Path $RootOut "evidence"
 $OutCsv    = Join-Path $RootOut "aks_admission_runtime_assessment_$Timestamp.csv"
 
-# Optional: Generate a flattened evidence_summary.json per cluster (CSV-friendly)
+# Optional: Generate flattened evidence_summary.json per cluster
 $GenerateEvidenceSummary = $true
 
 New-Item -ItemType Directory -Path $RootOut -Force | Out-Null
@@ -81,9 +72,12 @@ function Invoke-AksKubectlJson {
         # Strip warnings before JSON
         $firstBrace = $logs.IndexOf("{")
         $firstBracket = $logs.IndexOf("[")
-        $start = @($firstBrace, $firstBracket) | Where-Object { $_ -ge 0 } | Sort-Object | Select-Object -First 1
-        if ($null -eq $start) { return $null }
+        $startCandidates = @()
+        if ($firstBrace -ge 0) { $startCandidates += $firstBrace }
+        if ($firstBracket -ge 0) { $startCandidates += $firstBracket }
+        if (-not $startCandidates -or $startCandidates.Count -eq 0) { return $null }
 
+        $start = ($startCandidates | Sort-Object | Select-Object -First 1)
         $jsonText = $logs.Substring($start).Trim()
         return ($jsonText | ConvertFrom-Json)
     }
@@ -110,7 +104,7 @@ function Get-PolicyAssignmentsEvidence {
     try { $rgAssignments  = az policy assignment list --scope $rgScope -o json | ConvertFrom-Json } catch { $rgAssignments  = @() }
     try { $aksAssignments = az policy assignment list --scope $ClusterResourceId -o json | ConvertFrom-Json } catch { $aksAssignments = @() }
 
-    # Lightweight hints for image/registry-related policies
+    # Hints for image/registry-related policies
     $imageHint = @()
     foreach ($a in @($subAssignments + $rgAssignments + $aksAssignments)) {
         $n = $a.properties.displayName
@@ -118,17 +112,20 @@ function Get-PolicyAssignmentsEvidence {
         $setId = $a.properties.policySetDefinitionId
 
         $hit = $false
-        if ($n -match 'image|images|registry|registries|ACR|container' ) { $hit = $true }
-        if ($dnId -match 'image|registry|container' ) { $hit = $true }
-        if ($setId -match 'image|registry|container' ) { $hit = $true }
+        if ($n -match 'image|images|registry|registries|ACR|container') { $hit = $true }
+        if ($dnId -match 'image|registry|container') { $hit = $true }
+        if ($setId -match 'image|registry|container') { $hit = $true }
 
-        if ($hit) { $imageHint += ($n ? $n : $a.name) }
+        if ($hit) {
+            if (-not [string]::IsNullOrWhiteSpace($n)) { $imageHint += $n }
+            else { $imageHint += $a.name }
+        }
     }
 
     return [PSCustomObject]@{
-        SubscriptionAssignments  = $subAssignments
-        ResourceGroupAssignments = $rgAssignments
-        ClusterAssignments       = $aksAssignments
+        SubscriptionAssignments   = $subAssignments
+        ResourceGroupAssignments  = $rgAssignments
+        ClusterAssignments        = $aksAssignments
         ImageTrustAssignmentHints = ($imageHint | Select-Object -Unique)
     }
 }
@@ -157,9 +154,8 @@ function Extract-ConstraintAssignmentMap {
 
                     $candidate = @($k,$v) | Where-Object { $_ -match "/providers/Microsoft\.Authorization/policyAssignments/" }
                     foreach ($s in $candidate) {
-                        # ✅ FIX: Use a single-quoted PowerShell string so regex escapes are not interpreted by PowerShell.
-                        # This extracts "/subscriptions/.../providers/Microsoft.Authorization/policyAssignments/..."
-                        $m = [regex]::Match($s, '(/subscriptions/[^ ]+/providers/Microsoft\.Authorization/policyAssignments/[^"'',]+)')
+                        # PS5.1 safe regex string (single-quoted PowerShell string)
+                        $m = [regex]::Match($s, '(/subscriptions/[^ ]+/providers/Microsoft\.Authorization/policyAssignments/[^"'',\s]+)')
                         if ($m.Success) { $assignmentIds += $m.Groups[1].Value }
                     }
                 }
@@ -180,7 +176,6 @@ function Extract-ConstraintAssignmentMap {
 function Find-AcrOnlySignalsInGatekeeperConstraint {
     param([Parameter(Mandatory=$true)]$ConstraintItem)
 
-    # Best-effort: inspect full JSON for azurecr.io patterns and allowlist keywords
     $signals = @()
     $json = $null
     try { $json = ($ConstraintItem | ConvertTo-Json -Depth 70) } catch { return @() }
@@ -207,32 +202,39 @@ function Detect-Kyverno {
     $clusterPolicies = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get clusterpolicies.kyverno.io -o json'
     $policies        = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get policies.kyverno.io -A -o json'
 
-    $cpCount = ($clusterPolicies.items.Count)
-    $pCount  = ($policies.items.Count)
+    $cpCount = 0
+    $pCount  = 0
+    if ($clusterPolicies -and $clusterPolicies.items) { $cpCount = $clusterPolicies.items.Count }
+    if ($policies -and $policies.items) { $pCount = $policies.items.Count }
 
     $kyvernoPodNames = @()
     if ($kyvernoPods -and $kyvernoPods.items) { $kyvernoPodNames = $kyvernoPods.items.metadata.name }
 
     $cpNames = @()
-    if ($clusterPolicies.items) { $cpNames = $clusterPolicies.items.metadata.name }
+    if ($clusterPolicies -and $clusterPolicies.items) { $cpNames = $clusterPolicies.items.metadata.name }
 
-    # Best-effort image/registry/ACR signals
     $acrSignals = @()
     $imagePolicyHints = @()
 
     if ($clusterPolicies -and $clusterPolicies.items) {
         foreach ($item in $clusterPolicies.items) {
-            $name = $item.metadata.name
+            $pname = $item.metadata.name
             $txt = ""
             try { $txt = ($item | ConvertTo-Json -Depth 70) } catch { $txt = "" }
 
-            if ($txt -match "verifyImages") { $imagePolicyHints += "verifyImages:$name" }
-            if ($txt -match "image" -and $txt -match "registry|registries|allowed|deny|block|restrict") { $imagePolicyHints += "image_validate:$name" }
-            if ($txt -match "\*\.azurecr\.io" -or $txt -match "azurecr\.io") { $acrSignals += "kyverno_mentions_azurecr_io:$name" }
+            if ($txt -match "verifyImages") { $imagePolicyHints += ("verifyImages:" + $pname) }
+            if ($txt -match "image" -and $txt -match "registry|registries|allowed|deny|block|restrict") {
+                $imagePolicyHints += ("image_validate:" + $pname)
+            }
+            if ($txt -match "\*\.azurecr\.io" -or $txt -match "azurecr\.io") { $acrSignals += ("kyverno_mentions_azurecr_io:" + $pname) }
         }
     }
 
-    $installed = ($kyvernoNs -ne $null) -or (($kyvernoPods.items.Count) -gt 0) -or ($cpCount -gt 0) -or ($pCount -gt 0)
+    $installed = $false
+    if ($kyvernoNs -ne $null) { $installed = $true }
+    if (-not $installed -and $kyvernoPods -and $kyvernoPods.items -and $kyvernoPods.items.Count -gt 0) { $installed = $true }
+    if (-not $installed -and $cpCount -gt 0) { $installed = $true }
+    if (-not $installed -and $pCount -gt 0) { $installed = $true }
 
     return [PSCustomObject]@{
         Installed = [bool]$installed
@@ -335,7 +337,7 @@ function Flatten-EvidenceSummary {
         policyAssignments_ClusterCount       = To-FlatString $CsvRow.PolicyAssignments_ClusterCount
 
         evidenceFilePath        = To-FlatString $CsvRow.EvidenceFilePath
-        evidenceSummaryFilePath = "" # set after write
+        evidenceSummaryFilePath = ""
     }
 
     return $summary
@@ -355,10 +357,11 @@ foreach ($sub in $subs) {
     $subName = $sub.name
     $subScope = "/subscriptions/$subId"
 
-    Write-Progress -Activity "AKS Admission/Runtime Assessment" -Status "Subscription $subIndex/$($subs.Count): $subName" -PercentComplete ([int](($subIndex/$subs.Count)*100))
-    Write-Host "`n=== Subscription: $subName ($subId) ==="
+    Write-Progress -Activity "AKS Admission/Runtime Assessment" -Status ("Subscription {0}/{1}: {2}" -f $subIndex, $subs.Count, $subName) -PercentComplete ([int](($subIndex/$subs.Count)*100))
+    Write-Host ""
+    Write-Host ("=== Subscription: {0} ({1}) ===" -f $subName, $subId)
 
-    # Defender for Cloud plans (subscription-level)
+    # Defender pricing (subscription-level)
     $defenderPricing = @()
     $defenderK8sTier = $null
     $defenderAcrTier = $null
@@ -368,17 +371,17 @@ foreach ($sub in $subs) {
         $acr = $defenderPricing | Where-Object { $_.name -eq "ContainerRegistry" } | Select-Object -First 1
         $defenderK8sTier = $k8s.pricingTier
         $defenderAcrTier = $acr.pricingTier
-        Write-Host "Defender pricing: KubernetesService=$defenderK8sTier ; ContainerRegistry=$defenderAcrTier"
+        Write-Host ("Defender pricing: KubernetesService={0} ; ContainerRegistry={1}" -f $defenderK8sTier, $defenderAcrTier)
     } catch {
-        Write-Warning "Could not query Defender pricing in subscription $subId."
+        Write-Warning ("Could not query Defender pricing in subscription {0}" -f $subId)
     }
 
-    # List AKS clusters
+    # AKS clusters
     $clusters = @()
     try {
         $clusters = az aks list --subscription $subId -o json | ConvertFrom-Json
     } catch {
-        Write-Warning "Failed to list AKS clusters in subscription $subId. Skipping subscription."
+        Write-Warning ("Failed to list AKS clusters in subscription {0}. Skipping subscription." -f $subId)
         continue
     }
 
@@ -395,24 +398,25 @@ foreach ($sub in $subs) {
         $location = $c.location
         $k8sVersion = $c.kubernetesVersion
 
-        Write-Progress -Activity "Subscription: $subName" -Status "Cluster $clusterIndex/$($clusters.Count): $name" -PercentComplete ([int](($clusterIndex/$clusters.Count)*100))
-        Write-Host "-> Assessing AKS: $name (RG: $rg, Region: $location, K8s: $k8sVersion)"
+        Write-Progress -Activity ("Subscription: {0}" -f $subName) -Status ("Cluster {0}/{1}: {2}" -f $clusterIndex, $clusters.Count, $name) -PercentComplete ([int](($clusterIndex/$clusters.Count)*100))
+        Write-Host ("-> Assessing AKS: {0} (RG: {1}, Region: {2}, K8s: {3})" -f $name, $rg, $location, $k8sVersion)
 
         $aks = $null
-        try { $aks = az aks show --subscription $subId -g $rg -n $name -o json | ConvertFrom-Json } catch { Write-Warning "az aks show failed for $name." }
+        try { $aks = az aks show --subscription $subId -g $rg -n $name -o json | ConvertFrom-Json } catch { Write-Warning ("az aks show failed for {0}." -f $name) }
 
-        $clusterId = $aks.id
-        if (-not $clusterId) { $clusterId = $c.id }
+        $clusterId = $null
+        if ($aks -and $aks.id) { $clusterId = $aks.id }
+        else { $clusterId = $c.id }
 
-        $clusterEvidenceDir = Join-Path $EvidenceRoot "$($subId)\$($rg)\$($name)"
+        $clusterEvidenceDir = Join-Path $EvidenceRoot ("{0}\{1}\{2}" -f $subId, $rg, $name)
         New-Item -ItemType Directory -Path $clusterEvidenceDir -Force | Out-Null
         $evidenceFile = Join-Path $clusterEvidenceDir "evidence.json"
         $evidenceSummaryFile = Join-Path $clusterEvidenceDir "evidence_summary.json"
 
-        Write-Host "   [1/5] Azure Policy assignments (sub/RG/cluster scopes)..."
+        Write-Host "   [1/5] Azure Policy assignments..."
         $policyEvidence = Get-PolicyAssignmentsEvidence -SubscriptionId $subId -SubscriptionScope $subScope -ResourceGroup $rg -ClusterResourceId $clusterId
 
-        Write-Host "   [2/5] ARM posture (azure-policy add-on, securityProfile, identity)..."
+        Write-Host "   [2/5] ARM posture..."
         $azurePolicyAddonEnabled = $false
         $securityProfileRawJson = $null
         $defenderEnabledArm = $null
@@ -437,8 +441,11 @@ foreach ($sub in $subs) {
         $constraintsAll      = Invoke-AksKubectlJson -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name -KubectlCommand 'get constraints -o json'
         $namespaces          = Invoke-AksKubectlJson -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name -KubectlCommand 'get ns -o json'
 
-        $inClusterOk = ($validatingWebhooks -or $mutatingWebhooks -or $gatekeeperPods -or $namespaces -or $constraintsAll -or $constraintTemplates)
-        $inClusterStatus = $inClusterOk ? "OK" : "FAILED_OR_NOT_AUTHORIZED"
+        $inClusterOk = $false
+        if ($validatingWebhooks -or $mutatingWebhooks -or $gatekeeperPods -or $namespaces -or $constraintsAll -or $constraintTemplates) { $inClusterOk = $true }
+
+        $inClusterStatus = "FAILED_OR_NOT_AUTHORIZED"
+        if ($inClusterOk) { $inClusterStatus = "OK" }
 
         $gatekeeperInstalled = $false
         $gatekeeperPodNames = @()
@@ -447,43 +454,48 @@ foreach ($sub in $subs) {
             $gatekeeperPodNames = $gatekeeperPods.items.metadata.name
         }
 
-        $validatingWebhookCount  = ($validatingWebhooks.items.Count)
-        $mutatingWebhookCount    = ($mutatingWebhooks.items.Count)
-        $constraintTemplateCount = ($constraintTemplates.items.Count)
-        $constraintsCount        = ($constraintsAll.items.Count)
+        $validatingWebhookCount  = 0
+        $mutatingWebhookCount    = 0
+        $constraintTemplateCount = 0
+        $constraintsCount        = 0
+
+        if ($validatingWebhooks -and $validatingWebhooks.items) { $validatingWebhookCount = $validatingWebhooks.items.Count }
+        if ($mutatingWebhooks -and $mutatingWebhooks.items) { $mutatingWebhookCount = $mutatingWebhooks.items.Count }
+        if ($constraintTemplates -and $constraintTemplates.items) { $constraintTemplateCount = $constraintTemplates.items.Count }
+        if ($constraintsAll -and $constraintsAll.items) { $constraintsCount = $constraintsAll.items.Count }
 
         $webhookNamesSample = @()
-        if ($validatingWebhooks.items) { $webhookNamesSample += ($validatingWebhooks.items.metadata.name | Select-Object -First 10) }
-        if ($mutatingWebhooks.items)   { $webhookNamesSample += ($mutatingWebhooks.items.metadata.name | Select-Object -First 10) }
+        if ($validatingWebhooks -and $validatingWebhooks.items) { $webhookNamesSample += ($validatingWebhooks.items.metadata.name | Select-Object -First 10) }
+        if ($mutatingWebhooks -and $mutatingWebhooks.items) { $webhookNamesSample += ($mutatingWebhooks.items.metadata.name | Select-Object -First 10) }
 
         # Azure Policy ↔ Gatekeeper mapping
         $constraintAssignmentMap = Extract-ConstraintAssignmentMap -ConstraintsJson $constraintsAll
-        $mappedConstraints = $constraintAssignmentMap | Where-Object { $_.AssignmentIds -and $_.AssignmentIds.Count -gt 0 }
+        $mappedConstraints = @($constraintAssignmentMap | Where-Object { $_.AssignmentIds -and $_.AssignmentIds.Count -gt 0 })
 
-        # ACR-only signals + trusted image hints from constraints
+        # Trusted images + ACR-only signals
         $acrOnlyGatekeeperSignals = @()
         $trustedImageSignals = @()
         $constraintKinds = @()
 
         if ($constraintsAll -and $constraintsAll.items) {
             foreach ($item in $constraintsAll.items) {
-                $kind = $item.kind
-                $n = $item.metadata.name
-                if ($kind) { $constraintKinds += $kind }
+                $ckind = $item.kind
+                $cname = $item.metadata.name
+                if ($ckind) { $constraintKinds += $ckind }
 
-                if ($kind -match 'AllowedRepos|AllowedImages|AllowedRegistries|K8sAllowedRepos|AllowedRegistry' -or
-                    $n -match 'allowed|trusted|registry|image|repo') {
-                    $trustedImageSignals += "$kind/$n"
+                if ($ckind -match 'AllowedRepos|AllowedImages|AllowedRegistries|K8sAllowedRepos|AllowedRegistry' -or
+                    $cname -match 'allowed|trusted|registry|image|repo') {
+                    $trustedImageSignals += ("{0}/{1}" -f $ckind, $cname)
                 }
 
                 $acrSignals = Find-AcrOnlySignalsInGatekeeperConstraint -ConstraintItem $item
-                if ($acrSignals.Count -gt 0) {
-                    $acrOnlyGatekeeperSignals += "$kind/$n:" + ($acrSignals -join ",")
+                if ($acrSignals -and $acrSignals.Count -gt 0) {
+                    $acrOnlyGatekeeperSignals += ("{0}/{1}:{2}" -f $ckind, $cname, ($acrSignals -join ","))
                 }
             }
         }
 
-        # PSA signals
+        # PSA
         $psaEnforcedNamespaces = @()
         $psaLevels = @()
         if ($namespaces -and $namespaces.items) {
@@ -499,30 +511,36 @@ foreach ($sub in $subs) {
             }
         }
 
-        Write-Host "   [4/5] Kyverno detection (pods + ClusterPolicies/Policies)..."
+        Write-Host "   [4/5] Kyverno detection..."
         $kyverno = Detect-Kyverno -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name
 
-        Write-Host "   [5/5] Writing evidence files..."
-        # Resolve assignment IDs from constraints -> display names (within collected scopes)
+        Write-Host "   [5/5] Writing evidence..."
+        # Resolve mapped assignment IDs -> display names
         $allAssignments = @($policyEvidence.SubscriptionAssignments + $policyEvidence.ResourceGroupAssignments + $policyEvidence.ClusterAssignments)
         $assignmentById = @{}
         foreach ($a in $allAssignments) {
-            if ($a.id) { $assignmentById[$a.id] = ($a.properties.displayName ? $a.properties.displayName : $a.name) }
+            if ($a.id) {
+                $display = $a.name
+                if ($a.properties -and $a.properties.displayName -and -not [string]::IsNullOrWhiteSpace($a.properties.displayName)) {
+                    $display = $a.properties.displayName
+                }
+                $assignmentById[$a.id] = $display
+            }
         }
 
         $mappedAssignmentNames = @()
         foreach ($m in $mappedConstraints) {
             foreach ($aid in $m.AssignmentIds) {
                 if ($assignmentById.ContainsKey($aid)) { $mappedAssignmentNames += $assignmentById[$aid] }
-                else { $mappedAssignmentNames += "UNRESOLVED:$aid" }
+                else { $mappedAssignmentNames += ("UNRESOLVED:{0}" -f $aid) }
             }
         }
 
-        # One evidence object per cluster
+        # Evidence object
         $evidenceObject = [PSCustomObject]@{
             metadata = [PSCustomObject]@{
                 generatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-                tool = "Assess-AKS-AdmissionRuntime-AllSubs-OneEvidencePerCluster.ps1"
+                tool = "Assess-AKS-AdmissionRuntime-AllSubs-PS51.ps1"
             }
             cluster = [PSCustomObject]@{
                 subscriptionName = $subName
@@ -544,7 +562,7 @@ foreach ($sub in $subs) {
                 acrOnlySignals_gatekeeper      = ($acrOnlyGatekeeperSignals | Select-Object -Unique)
                 acrOnlySignals_kyverno         = ($kyverno.AcrSignals | Select-Object -Unique)
 
-                azurePolicyConstraintsWithAssignmentIdCount = @($mappedConstraints).Count
+                azurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
                 azurePolicyAssignmentNamesFromConstraints   = ($mappedAssignmentNames | Select-Object -Unique)
 
                 psaEnforcedNamespaces = ($psaEnforcedNamespaces | Select-Object -Unique)
@@ -563,7 +581,6 @@ foreach ($sub in $subs) {
                     policies        = $kyverno.PolicyCount
                 }
             }
-
             evidence = [PSCustomObject]@{
                 arm = [PSCustomObject]@{
                     aksShow = $aks
@@ -590,12 +607,12 @@ foreach ($sub in $subs) {
                     }
                 }
                 inCluster = [PSCustomObject]@{
-                    gatekeeperPods       = $gatekeeperPods
-                    validatingWebhooks   = $validatingWebhooks
-                    mutatingWebhooks     = $mutatingWebhooks
-                    constraintTemplates  = $constraintTemplates
-                    constraints          = $constraintsAll
-                    namespaces           = $namespaces
+                    gatekeeperPods      = $gatekeeperPods
+                    validatingWebhooks  = $validatingWebhooks
+                    mutatingWebhooks    = $mutatingWebhooks
+                    constraintTemplates = $constraintTemplates
+                    constraints         = $constraintsAll
+                    namespaces          = $namespaces
                 }
                 kyverno = $kyverno.Evidence
             }
@@ -613,10 +630,10 @@ foreach ($sub in $subs) {
             KubernetesVersion                = $k8sVersion
             ClusterResourceId                = $clusterId
 
-            PolicyAssignments_SubscriptionCount = @($policyEvidence.SubscriptionAssignments).Count
+            PolicyAssignments_SubscriptionCount  = @($policyEvidence.SubscriptionAssignments).Count
             PolicyAssignments_ResourceGroupCount = @($policyEvidence.ResourceGroupAssignments).Count
-            PolicyAssignments_ClusterCount      = @($policyEvidence.ClusterAssignments).Count
-            PolicyImageTrustAssignmentHints     = (Safe-Join -Items $policyEvidence.ImageTrustAssignmentHints)
+            PolicyAssignments_ClusterCount       = @($policyEvidence.ClusterAssignments).Count
+            PolicyImageTrustAssignmentHints      = (Safe-Join -Items $policyEvidence.ImageTrustAssignmentHints)
 
             AzurePolicyAddonEnabled          = $azurePolicyAddonEnabled
             GatekeeperInstalled              = $gatekeeperInstalled
@@ -640,7 +657,7 @@ foreach ($sub in $subs) {
             ACR_Only_Signals_Gatekeeper      = (Safe-Join -Items $acrOnlyGatekeeperSignals)
             ACR_Only_Signals_Kyverno         = (Safe-Join -Items $kyverno.AcrSignals)
 
-            AzurePolicyConstraintsWithAssignmentIdCount = @($mappedConstraints).Count
+            AzurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
             AzurePolicyAssignmentNamesFromConstraints   = (Safe-Join -Items ($mappedAssignmentNames | Select-Object -Unique))
 
             PSAEnforcedNamespacesCount       = ($psaEnforcedNamespaces | Select-Object -Unique).Count
@@ -659,7 +676,7 @@ foreach ($sub in $subs) {
             EvidenceSummaryFilePath          = ""
         }
 
-        # Optional flattened evidence summary per cluster
+        # Optional summary
         if ($GenerateEvidenceSummary) {
             $summaryObj = Flatten-EvidenceSummary -EvidenceObject $evidenceObject -CsvRow $row
             $summaryObj.evidenceSummaryFilePath = $evidenceSummaryFile
@@ -669,16 +686,17 @@ foreach ($sub in $subs) {
 
         $results.Add($row) | Out-Null
 
-        Write-Host "   Completed: $name (InCluster=$inClusterStatus, Gatekeeper=$gatekeeperInstalled, Kyverno=$($kyverno.Installed))"
-        Write-Host "   Evidence: $evidenceFile"
-        if ($GenerateEvidenceSummary) { Write-Host "   Evidence summary: $evidenceSummaryFile" }
+        Write-Host ("   Completed: {0} (InCluster={1}, Gatekeeper={2}, Kyverno={3})" -f $name, $inClusterStatus, $gatekeeperInstalled, $kyverno.Installed)
+        Write-Host ("   Evidence: {0}" -f $evidenceFile)
+        if ($GenerateEvidenceSummary) { Write-Host ("   Evidence summary: {0}" -f $evidenceSummaryFile) }
     }
 }
 
 $results | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
 
 Write-Progress -Activity "AKS Admission/Runtime Assessment" -Completed -Status "Done"
-Write-Host "`nDone."
-Write-Host "CSV: $OutCsv"
-Write-Host "Evidence root: $EvidenceRoot"
+Write-Host ""
+Write-Host "Done."
+Write-Host ("CSV: {0}" -f $OutCsv)
+Write-Host ("Evidence root: {0}" -f $EvidenceRoot)
 Write-Host "Per cluster: evidence.json + (optional) evidence_summary.json"
