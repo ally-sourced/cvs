@@ -1,5 +1,6 @@
 <#
 PowerShell 5.1 compatible AKS admission/runtime assessment across ALL Azure subscriptions.
+StrictMode-safe (no ternary, no assumptions that .Count exists).
 
 Outputs:
 - Consolidated CSV (one row per AKS cluster)
@@ -28,6 +29,40 @@ $GenerateEvidenceSummary = $true
 
 New-Item -ItemType Directory -Path $RootOut -Force | Out-Null
 New-Item -ItemType Directory -Path $EvidenceRoot -Force | Out-Null
+
+# ---------- Helpers ----------
+function Get-Count {
+    param([Parameter(Mandatory=$false)]$Value)
+
+    if ($null -eq $Value) { return 0 }
+
+    # Strings are IEnumerable but we want count=1
+    if ($Value -is [string]) { return 1 }
+
+    # If it's a collection with Count, use it
+    try {
+        $c = $Value.Count
+        if ($null -ne $c) { return [int]$c }
+    } catch { }
+
+    # If it's IEnumerable, enumerate
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $n = 0
+        foreach ($x in $Value) { $n++ }
+        return $n
+    }
+
+    # Scalar object
+    return 1
+}
+
+function As-Array {
+    param([Parameter(Mandatory=$false)]$Value)
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [string]) { return @($Value) }
+    if ($Value -is [System.Collections.IEnumerable]) { return @($Value) }
+    return @($Value)
+}
 
 function Write-JsonFile {
     param(
@@ -66,7 +101,8 @@ function Invoke-AksKubectlJson {
             -o json 2>$null | ConvertFrom-Json
 
         if (-not $raw) { return $null }
-        $logs = $raw.logs
+        $logs = $null
+        try { $logs = $raw.logs } catch { $logs = $null }
         if ([string]::IsNullOrWhiteSpace($logs)) { return $null }
 
         # Strip warnings before JSON
@@ -75,7 +111,7 @@ function Invoke-AksKubectlJson {
         $startCandidates = @()
         if ($firstBrace -ge 0) { $startCandidates += $firstBrace }
         if ($firstBracket -ge 0) { $startCandidates += $firstBracket }
-        if (-not $startCandidates -or $startCandidates.Count -eq 0) { return $null }
+        if (Get-Count $startCandidates -eq 0) { return $null }
 
         $start = ($startCandidates | Sort-Object | Select-Object -First 1)
         $jsonText = $logs.Substring($start).Trim()
@@ -100,24 +136,15 @@ function Get-PolicyAssignmentsEvidence {
     $rgAssignments  = @()
     $aksAssignments = @()
 
-    try {
-        $subAssignments = az policy assignment list --scope $SubscriptionScope -o json | ConvertFrom-Json
-        if (-not $subAssignments) { $subAssignments = @() }
-        elseif ($subAssignments -isnot [System.Collections.IEnumerable]) { $subAssignments = @($subAssignments) }
-    } catch { $subAssignments = @() }
+    try { $subAssignments = az policy assignment list --scope $SubscriptionScope -o json | ConvertFrom-Json } catch { $subAssignments = @() }
+    try { $rgAssignments  = az policy assignment list --scope $rgScope -o json | ConvertFrom-Json } catch { $rgAssignments  = @() }
+    try { $aksAssignments = az policy assignment list --scope $ClusterResourceId -o json | ConvertFrom-Json } catch { $aksAssignments = @() }
 
-    try {
-        $rgAssignments = az policy assignment list --scope $rgScope -o json | ConvertFrom-Json
-        if (-not $rgAssignments) { $rgAssignments = @() }
-        elseif ($rgAssignments -isnot [System.Collections.IEnumerable]) { $rgAssignments = @($rgAssignments) }
-    } catch { $rgAssignments = @() }
+    $subAssignments = As-Array $subAssignments
+    $rgAssignments  = As-Array $rgAssignments
+    $aksAssignments = As-Array $aksAssignments
 
-    try {
-        $aksAssignments = az policy assignment list --scope $ClusterResourceId -o json | ConvertFrom-Json
-        if (-not $aksAssignments) { $aksAssignments = @() }
-        elseif ($aksAssignments -isnot [System.Collections.IEnumerable]) { $aksAssignments = @($aksAssignments) }
-    } catch { $aksAssignments = @() }
-
+    # Hints for image/registry-related policies (strict-mode safe)
     $imageHint = @()
     foreach ($a in @($subAssignments + $rgAssignments + $aksAssignments)) {
 
@@ -158,21 +185,28 @@ function Get-PolicyAssignmentsEvidence {
     }
 }
 
-# ---- UPDATED: now null-tolerant and not Mandatory ----
 function Extract-ConstraintAssignmentMap {
     param([Parameter(Mandatory=$false)]$ConstraintsJson)
 
     $map = New-Object System.Collections.Generic.List[object]
     if ($null -eq $ConstraintsJson) { return $map }
-    if (-not $ConstraintsJson.items) { return $map }
 
-    foreach ($c in $ConstraintsJson.items) {
-        $kind = $c.kind
-        $name = $c.metadata.name
-        $ns   = $c.metadata.namespace
+    $items = $null
+    try { $items = $ConstraintsJson.items } catch { $items = $null }
+    if ($null -eq $items) { return $map }
 
-        $ann = $c.metadata.annotations
+    foreach ($c in (As-Array $items)) {
+        if ($null -eq $c) { continue }
+
+        $kind = $null; $name = $null; $ns = $null
+        try { $kind = $c.kind } catch { }
+        try { $name = $c.metadata.name } catch { }
+        try { $ns = $c.metadata.namespace } catch { }
+
         $assignmentIds = @()
+        $ann = $null
+        try { $ann = $c.metadata.annotations } catch { $ann = $null }
+
         if ($ann) {
             foreach ($p in $ann.PSObject.Properties) {
                 $k = [string]$p.Name
@@ -226,41 +260,49 @@ function Detect-Kyverno {
 
     $kyvernoNs   = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get ns kyverno -o json'
     $kyvernoPods = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get pods -n kyverno -o json'
-
     $clusterPolicies = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get clusterpolicies.kyverno.io -o json'
     $policies        = Invoke-AksKubectlJson -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ClusterName $ClusterName -KubectlCommand 'get policies.kyverno.io -A -o json'
 
-    $cpCount = 0
-    $pCount  = 0
-    if ($clusterPolicies -and $clusterPolicies.items) { $cpCount = $clusterPolicies.items.Count }
-    if ($policies -and $policies.items) { $pCount = $policies.items.Count }
+    $cpItems = $null; $pItems = $null
+    try { $cpItems = $clusterPolicies.items } catch { $cpItems = $null }
+    try { $pItems  = $policies.items } catch { $pItems = $null }
+
+    $cpCount = Get-Count $cpItems
+    $pCount  = Get-Count $pItems
 
     $kyvernoPodNames = @()
-    if ($kyvernoPods -and $kyvernoPods.items) { $kyvernoPodNames = $kyvernoPods.items.metadata.name }
+    $podItems = $null
+    try { $podItems = $kyvernoPods.items } catch { $podItems = $null }
+    foreach ($pi in (As-Array $podItems)) {
+        try { $kyvernoPodNames += $pi.metadata.name } catch { }
+    }
 
     $cpNames = @()
-    if ($clusterPolicies -and $clusterPolicies.items) { $cpNames = $clusterPolicies.items.metadata.name }
+    foreach ($cp in (As-Array $cpItems)) {
+        try { $cpNames += $cp.metadata.name } catch { }
+    }
 
     $acrSignals = @()
     $imagePolicyHints = @()
 
-    if ($clusterPolicies -and $clusterPolicies.items) {
-        foreach ($item in $clusterPolicies.items) {
-            $pname = $item.metadata.name
-            $txt = ""
-            try { $txt = ($item | ConvertTo-Json -Depth 70) } catch { $txt = "" }
+    foreach ($item in (As-Array $cpItems)) {
+        if ($null -eq $item) { continue }
+        $pname = $null
+        try { $pname = $item.metadata.name } catch { $pname = "" }
 
-            if ($txt -match "verifyImages") { $imagePolicyHints += ("verifyImages:" + $pname) }
-            if ($txt -match "image" -and $txt -match "registry|registries|allowed|deny|block|restrict") {
-                $imagePolicyHints += ("image_validate:" + $pname)
-            }
-            if ($txt -match "\*\.azurecr\.io" -or $txt -match "azurecr\.io") { $acrSignals += ("kyverno_mentions_azurecr_io:" + $pname) }
+        $txt = ""
+        try { $txt = ($item | ConvertTo-Json -Depth 70) } catch { $txt = "" }
+
+        if ($txt -match "verifyImages") { $imagePolicyHints += ("verifyImages:" + $pname) }
+        if ($txt -match "image" -and $txt -match "registry|registries|allowed|deny|block|restrict") {
+            $imagePolicyHints += ("image_validate:" + $pname)
         }
+        if ($txt -match "\*\.azurecr\.io" -or $txt -match "azurecr\.io") { $acrSignals += ("kyverno_mentions_azurecr_io:" + $pname) }
     }
 
     $installed = $false
     if ($kyvernoNs -ne $null) { $installed = $true }
-    if (-not $installed -and $kyvernoPods -and $kyvernoPods.items -and $kyvernoPods.items.Count -gt 0) { $installed = $true }
+    if (-not $installed -and (Get-Count $podItems) -gt 0) { $installed = $true }
     if (-not $installed -and $cpCount -gt 0) { $installed = $true }
     if (-not $installed -and $pCount -gt 0) { $installed = $true }
 
@@ -312,7 +354,7 @@ function Flatten-EvidenceSummary {
     $def = $EvidenceObject.evidence.defender
     $pol = $EvidenceObject.evidence.azurePolicy
 
-    $summary = [PSCustomObject]@{
+    return [PSCustomObject]@{
         generatedAtUtc = To-FlatString $m.generatedAtUtc
         tool           = To-FlatString $m.tool
 
@@ -367,25 +409,24 @@ function Flatten-EvidenceSummary {
         evidenceFilePath        = To-FlatString $CsvRow.EvidenceFilePath
         evidenceSummaryFilePath = ""
     }
-
-    return $summary
 }
 
 # -------- Main --------
 $results = New-Object System.Collections.Generic.List[object]
 
 Write-Host "Discovering subscriptions..."
-$subs = az account list -o json | ConvertFrom-Json
-if (-not $subs) { throw "No subscriptions returned. Run: az login" }
+$subs = As-Array (az account list -o json | ConvertFrom-Json)
+if (Get-Count $subs -eq 0) { throw "No subscriptions returned. Run: az login" }
 
 $subIndex = 0
 foreach ($sub in $subs) {
     $subIndex++
-    $subId = $sub.id
-    $subName = $sub.name
+    $subId = $null; $subName = $null
+    try { $subId = $sub.id } catch { $subId = "" }
+    try { $subName = $sub.name } catch { $subName = "" }
     $subScope = "/subscriptions/$subId"
 
-    Write-Progress -Activity "AKS Admission/Runtime Assessment" -Status ("Subscription {0}/{1}: {2}" -f $subIndex, $subs.Count, $subName) -PercentComplete ([int](($subIndex/$subs.Count)*100))
+    Write-Progress -Activity "AKS Admission/Runtime Assessment" -Status ("Subscription {0}/{1}: {2}" -f $subIndex, (Get-Count $subs), $subName) -PercentComplete ([int](($subIndex/(Get-Count $subs))*100))
     Write-Host ""
     Write-Host ("=== Subscription: {0} ({1}) ===" -f $subName, $subId)
 
@@ -394,11 +435,11 @@ foreach ($sub in $subs) {
     $defenderK8sTier = $null
     $defenderAcrTier = $null
     try {
-        $defenderPricing = az security pricing list --subscription $subId -o json | ConvertFrom-Json
+        $defenderPricing = As-Array (az security pricing list --subscription $subId -o json | ConvertFrom-Json)
         $k8s = $defenderPricing | Where-Object { $_.name -eq "KubernetesService" } | Select-Object -First 1
         $acr = $defenderPricing | Where-Object { $_.name -eq "ContainerRegistry" } | Select-Object -First 1
-        $defenderK8sTier = $k8s.pricingTier
-        $defenderAcrTier = $acr.pricingTier
+        try { $defenderK8sTier = $k8s.pricingTier } catch { $defenderK8sTier = $null }
+        try { $defenderAcrTier = $acr.pricingTier } catch { $defenderAcrTier = $null }
         Write-Host ("Defender pricing: KubernetesService={0} ; ContainerRegistry={1}" -f $defenderK8sTier, $defenderAcrTier)
     } catch {
         Write-Warning ("Could not query Defender pricing in subscription {0}" -f $subId)
@@ -407,13 +448,13 @@ foreach ($sub in $subs) {
     # AKS clusters
     $clusters = @()
     try {
-        $clusters = az aks list --subscription $subId -o json | ConvertFrom-Json
+        $clusters = As-Array (az aks list --subscription $subId -o json | ConvertFrom-Json)
     } catch {
         Write-Warning ("Failed to list AKS clusters in subscription {0}. Skipping subscription." -f $subId)
         continue
     }
 
-    if (-not $clusters -or $clusters.Count -eq 0) {
+    if (Get-Count $clusters -eq 0) {
         Write-Host "No AKS clusters found."
         continue
     }
@@ -421,20 +462,24 @@ foreach ($sub in $subs) {
     $clusterIndex = 0
     foreach ($c in $clusters) {
         $clusterIndex++
-        $rg = $c.resourceGroup
-        $name = $c.name
-        $location = $c.location
-        $k8sVersion = $c.kubernetesVersion
 
-        Write-Progress -Activity ("Subscription: {0}" -f $subName) -Status ("Cluster {0}/{1}: {2}" -f $clusterIndex, $clusters.Count, $name) -PercentComplete ([int](($clusterIndex/$clusters.Count)*100))
+        $rg = $null; $name = $null; $location = $null; $k8sVersion = $null
+        try { $rg = $c.resourceGroup } catch { $rg = "" }
+        try { $name = $c.name } catch { $name = "" }
+        try { $location = $c.location } catch { $location = "" }
+        try { $k8sVersion = $c.kubernetesVersion } catch { $k8sVersion = "" }
+
+        Write-Progress -Activity ("Subscription: {0}" -f $subName) -Status ("Cluster {0}/{1}: {2}" -f $clusterIndex, (Get-Count $clusters), $name) -PercentComplete ([int](($clusterIndex/(Get-Count $clusters))*100))
         Write-Host ("-> Assessing AKS: {0} (RG: {1}, Region: {2}, K8s: {3})" -f $name, $rg, $location, $k8sVersion)
 
         $aks = $null
         try { $aks = az aks show --subscription $subId -g $rg -n $name -o json | ConvertFrom-Json } catch { Write-Warning ("az aks show failed for {0}." -f $name) }
 
         $clusterId = $null
-        if ($aks -and $aks.id) { $clusterId = $aks.id }
-        else { $clusterId = $c.id }
+        try { if ($aks -and $aks.id) { $clusterId = $aks.id } } catch { }
+        if ([string]::IsNullOrWhiteSpace($clusterId)) {
+            try { $clusterId = $c.id } catch { $clusterId = "" }
+        }
 
         $clusterEvidenceDir = Join-Path $EvidenceRoot ("{0}\{1}\{2}" -f $subId, $rg, $name)
         New-Item -ItemType Directory -Path $clusterEvidenceDir -Force | Out-Null
@@ -461,7 +506,7 @@ foreach ($sub in $subs) {
             try { $privateCluster = $aks.apiServerAccessProfile.enablePrivateCluster } catch { $privateCluster = $null }
         }
 
-        Write-Host "   [3/5] In-cluster admission (Gatekeeper/webhooks/constraints/PSA)..."
+        Write-Host "   [3/5] In-cluster admission..."
         $gatekeeperPods      = Invoke-AksKubectlJson -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name -KubectlCommand 'get pods -n gatekeeper-system -o json'
         $validatingWebhooks  = Invoke-AksKubectlJson -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name -KubectlCommand 'get validatingwebhookconfigurations -o json'
         $mutatingWebhooks    = Invoke-AksKubectlJson -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name -KubectlCommand 'get mutatingwebhookconfigurations -o json'
@@ -471,70 +516,73 @@ foreach ($sub in $subs) {
 
         $inClusterOk = $false
         if ($validatingWebhooks -or $mutatingWebhooks -or $gatekeeperPods -or $namespaces -or $constraintsAll -or $constraintTemplates) { $inClusterOk = $true }
-
         $inClusterStatus = "FAILED_OR_NOT_AUTHORIZED"
         if ($inClusterOk) { $inClusterStatus = "OK" }
 
         $gatekeeperInstalled = $false
         $gatekeeperPodNames = @()
-        if ($gatekeeperPods -and $gatekeeperPods.items) {
+        $gkItems = $null
+        try { $gkItems = $gatekeeperPods.items } catch { $gkItems = $null }
+        if (Get-Count $gkItems -gt 0) {
             $gatekeeperInstalled = $true
-            $gatekeeperPodNames = $gatekeeperPods.items.metadata.name
+            foreach ($pi in (As-Array $gkItems)) { try { $gatekeeperPodNames += $pi.metadata.name } catch { } }
         }
 
-        $validatingWebhookCount  = 0
-        $mutatingWebhookCount    = 0
-        $constraintTemplateCount = 0
-        $constraintsCount        = 0
+        $vwItems = $null; $mwItems = $null; $ctItems = $null; $conItems = $null
+        try { $vwItems = $validatingWebhooks.items } catch { $vwItems = $null }
+        try { $mwItems = $mutatingWebhooks.items } catch { $mwItems = $null }
+        try { $ctItems = $constraintTemplates.items } catch { $ctItems = $null }
+        try { $conItems = $constraintsAll.items } catch { $conItems = $null }
 
-        if ($validatingWebhooks -and $validatingWebhooks.items) { $validatingWebhookCount = $validatingWebhooks.items.Count }
-        if ($mutatingWebhooks -and $mutatingWebhooks.items) { $mutatingWebhookCount = $mutatingWebhooks.items.Count }
-        if ($constraintTemplates -and $constraintTemplates.items) { $constraintTemplateCount = $constraintTemplates.items.Count }
-        if ($constraintsAll -and $constraintsAll.items) { $constraintsCount = $constraintsAll.items.Count }
+        $validatingWebhookCount  = Get-Count $vwItems
+        $mutatingWebhookCount    = Get-Count $mwItems
+        $constraintTemplateCount = Get-Count $ctItems
+        $constraintsCount        = Get-Count $conItems
 
         $webhookNamesSample = @()
-        if ($validatingWebhooks -and $validatingWebhooks.items) { $webhookNamesSample += ($validatingWebhooks.items.metadata.name | Select-Object -First 10) }
-        if ($mutatingWebhooks -and $mutatingWebhooks.items) { $webhookNamesSample += ($mutatingWebhooks.items.metadata.name | Select-Object -First 10) }
+        foreach ($w in (As-Array $vwItems)) { try { $webhookNamesSample += $w.metadata.name } catch { } }
+        foreach ($w in (As-Array $mwItems)) { try { $webhookNamesSample += $w.metadata.name } catch { } }
+        $webhookNamesSample = $webhookNamesSample | Select-Object -First 10
 
-        # Azure Policy ↔ Gatekeeper mapping (NULL SAFE)
         $constraintAssignmentMap = Extract-ConstraintAssignmentMap -ConstraintsJson $constraintsAll
-        $mappedConstraints = @($constraintAssignmentMap | Where-Object { $_.AssignmentIds -and $_.AssignmentIds.Count -gt 0 })
+        $mappedConstraints = @($constraintAssignmentMap | Where-Object { $_.AssignmentIds -and (Get-Count $_.AssignmentIds) -gt 0 })
+        $mappedConstraintsCount = Get-Count $mappedConstraints
 
-        # Trusted images + ACR-only signals
         $acrOnlyGatekeeperSignals = @()
         $trustedImageSignals = @()
         $constraintKinds = @()
 
-        if ($constraintsAll -and $constraintsAll.items) {
-            foreach ($item in $constraintsAll.items) {
-                $ckind = $item.kind
-                $cname = $item.metadata.name
-                if ($ckind) { $constraintKinds += $ckind }
+        foreach ($item in (As-Array $conItems)) {
+            if ($null -eq $item) { continue }
+            $ckind = $null; $cname = $null
+            try { $ckind = $item.kind } catch { $ckind = "" }
+            try { $cname = $item.metadata.name } catch { $cname = "" }
+            if (-not [string]::IsNullOrWhiteSpace($ckind)) { $constraintKinds += $ckind }
 
-                if ($ckind -match 'AllowedRepos|AllowedImages|AllowedRegistries|K8sAllowedRepos|AllowedRegistry' -or
-                    $cname -match 'allowed|trusted|registry|image|repo') {
-                    $trustedImageSignals += ("{0}/{1}" -f $ckind, $cname)
-                }
+            if ($ckind -match 'AllowedRepos|AllowedImages|AllowedRegistries|K8sAllowedRepos|AllowedRegistry' -or
+                $cname -match 'allowed|trusted|registry|image|repo') {
+                $trustedImageSignals += ("{0}/{1}" -f $ckind, $cname)
+            }
 
-                $acrSignals = Find-AcrOnlySignalsInGatekeeperConstraint -ConstraintItem $item
-                if ($acrSignals -and $acrSignals.Count -gt 0) {
-                    $acrOnlyGatekeeperSignals += ("{0}/{1}:{2}" -f $ckind, $cname, ($acrSignals -join ","))
-                }
+            $acrSignals = Find-AcrOnlySignalsInGatekeeperConstraint -ConstraintItem $item
+            if ((Get-Count $acrSignals) -gt 0) {
+                $acrOnlyGatekeeperSignals += ("{0}/{1}:{2}" -f $ckind, $cname, ((As-Array $acrSignals) -join ","))
             }
         }
 
-        # PSA
         $psaEnforcedNamespaces = @()
         $psaLevels = @()
-        if ($namespaces -and $namespaces.items) {
-            foreach ($ns in $namespaces.items) {
-                $labels = $ns.metadata.labels
-                if ($labels) {
-                    $enforce = $labels."pod-security.kubernetes.io/enforce"
-                    if ($enforce) {
-                        $psaEnforcedNamespaces += $ns.metadata.name
-                        $psaLevels += $enforce
-                    }
+        $nsItems = $null
+        try { $nsItems = $namespaces.items } catch { $nsItems = $null }
+        foreach ($ns in (As-Array $nsItems)) {
+            $labels = $null
+            try { $labels = $ns.metadata.labels } catch { $labels = $null }
+            if ($labels) {
+                $enforce = $null
+                try { $enforce = $labels."pod-security.kubernetes.io/enforce" } catch { $enforce = $null }
+                if ($enforce) {
+                    try { $psaEnforcedNamespaces += $ns.metadata.name } catch { }
+                    $psaLevels += $enforce
                 }
             }
         }
@@ -545,7 +593,7 @@ foreach ($sub in $subs) {
         Write-Host "   [5/5] Writing evidence..."
         $allAssignments = @($policyEvidence.SubscriptionAssignments + $policyEvidence.ResourceGroupAssignments + $policyEvidence.ClusterAssignments)
         $assignmentById = @{}
-        foreach ($a in $allAssignments) {
+        foreach ($a in (As-Array $allAssignments)) {
             if ($null -eq $a) { continue }
 
             $id = $null
@@ -567,8 +615,8 @@ foreach ($sub in $subs) {
         }
 
         $mappedAssignmentNames = @()
-        foreach ($m in $mappedConstraints) {
-            foreach ($aid in $m.AssignmentIds) {
+        foreach ($m in (As-Array $mappedConstraints)) {
+            foreach ($aid in (As-Array $m.AssignmentIds)) {
                 if ($assignmentById.ContainsKey($aid)) { $mappedAssignmentNames += $assignmentById[$aid] }
                 else { $mappedAssignmentNames += ("UNRESOLVED:{0}" -f $aid) }
             }
@@ -596,7 +644,7 @@ foreach ($sub in $subs) {
                 trustedImageSignals_gatekeeper = ($trustedImageSignals | Select-Object -Unique)
                 acrOnlySignals_gatekeeper      = ($acrOnlyGatekeeperSignals | Select-Object -Unique)
                 acrOnlySignals_kyverno         = ($kyverno.AcrSignals | Select-Object -Unique)
-                azurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
+                azurePolicyConstraintsWithAssignmentIdCount = $mappedConstraintsCount
                 azurePolicyAssignmentNamesFromConstraints   = ($mappedAssignmentNames | Select-Object -Unique)
                 psaEnforcedNamespaces = ($psaEnforcedNamespaces | Select-Object -Unique)
                 psaLevelsObserved     = ($psaLevels | Select-Object -Unique)
@@ -651,37 +699,48 @@ foreach ($sub in $subs) {
             Location                         = $location
             KubernetesVersion                = $k8sVersion
             ClusterResourceId                = $clusterId
-            PolicyAssignments_SubscriptionCount  = @($policyEvidence.SubscriptionAssignments).Count
-            PolicyAssignments_ResourceGroupCount = @($policyEvidence.ResourceGroupAssignments).Count
-            PolicyAssignments_ClusterCount       = @($policyEvidence.ClusterAssignments).Count
+
+            PolicyAssignments_SubscriptionCount  = Get-Count $policyEvidence.SubscriptionAssignments
+            PolicyAssignments_ResourceGroupCount = Get-Count $policyEvidence.ResourceGroupAssignments
+            PolicyAssignments_ClusterCount       = Get-Count $policyEvidence.ClusterAssignments
             PolicyImageTrustAssignmentHints      = (Safe-Join -Items $policyEvidence.ImageTrustAssignmentHints)
+
             AzurePolicyAddonEnabled          = $azurePolicyAddonEnabled
             GatekeeperInstalled              = $gatekeeperInstalled
             GatekeeperPodNamesSample         = (Safe-Join -Items ($gatekeeperPodNames | Select-Object -First 10))
+
             KyvernoInstalled                 = $kyverno.Installed
             KyvernoPodNamesSample            = (Safe-Join -Items $kyverno.PodNamesSample)
             KyvernoClusterPolicyCount        = $kyverno.ClusterPolicyCount
             KyvernoPolicyCount               = $kyverno.PolicyCount
             KyvernoImagePolicyHints          = (Safe-Join -Items $kyverno.ImagePolicyHints)
+
             ValidatingWebhookCount           = $validatingWebhookCount
             MutatingWebhookCount             = $mutatingWebhookCount
             WebhookNamesSample               = (Safe-Join -Items $webhookNamesSample)
+
             ConstraintTemplateCount          = $constraintTemplateCount
             ConstraintsCount                 = $constraintsCount
             ConstraintKinds                  = (Safe-Join -Items $constraintKinds)
+
             TrustedImageConstraintSignals    = (Safe-Join -Items $trustedImageSignals)
             ACR_Only_Signals_Gatekeeper      = (Safe-Join -Items $acrOnlyGatekeeperSignals)
             ACR_Only_Signals_Kyverno         = (Safe-Join -Items $kyverno.AcrSignals)
-            AzurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
+
+            AzurePolicyConstraintsWithAssignmentIdCount = $mappedConstraintsCount
             AzurePolicyAssignmentNamesFromConstraints   = (Safe-Join -Items ($mappedAssignmentNames | Select-Object -Unique))
-            PSAEnforcedNamespacesCount       = ($psaEnforcedNamespaces | Select-Object -Unique).Count
+
+            PSAEnforcedNamespacesCount       = Get-Count ($psaEnforcedNamespaces | Select-Object -Unique)
             PSALevelsObserved                = (Safe-Join -Items ($psaLevels | Select-Object -Unique))
+
             DefenderPricingTier_KubernetesService = $defenderK8sTier
             DefenderPricingTier_ContainerRegistry = $defenderAcrTier
             DefenderEnabledArmBestEffort          = $defenderEnabledArm
+
             PrivateCluster                   = $privateCluster
             OidcIssuerEnabled                = $oidcEnabled
             WorkloadIdentityEnabled          = $workloadIdentityEnabled
+
             InClusterQueryStatus             = $inClusterStatus
             EvidenceFilePath                 = $evidenceFile
             EvidenceSummaryFilePath          = ""
@@ -703,8 +762,8 @@ foreach ($sub in $subs) {
 }
 
 $results | Export-Csv -Path $OutCsv -NoTypeInformation -Encoding UTF8
-
 Write-Progress -Activity "AKS Admission/Runtime Assessment" -Completed -Status "Done"
+
 Write-Host ""
 Write-Host "Done."
 Write-Host ("CSV: {0}" -f $OutCsv)
