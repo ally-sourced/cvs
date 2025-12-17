@@ -7,16 +7,6 @@ Outputs:
   evidence.json (full)
   evidence_summary.json (optional flattened)
 
-Detects:
-- Azure Policy add-on enabled (ARM)
-- Azure Policy assignments at subscription/RG/cluster scopes (ARM)
-- Gatekeeper presence + constraints/templates + webhook configs (in-cluster)
-- Azure Policy ↔ Gatekeeper mapping via constraint annotations containing policyAssignment IDs (best-effort)
-- ACR-only pull patterns (Gatekeeper constraint content + Kyverno content: azurecr.io / *.azurecr.io)
-- PSA enforcement via namespace labels (pod-security.kubernetes.io/enforce)
-- Kyverno presence + ClusterPolicies/Policies + image-related hints (in-cluster)
-- Defender for Cloud pricing tiers (subscription-level; KubernetesService/ContainerRegistry)
-
 Prereqs:
 - az login
 - az cli installed
@@ -96,7 +86,6 @@ function Invoke-AksKubectlJson {
     }
 }
 
-# ---- UPDATED: strict-mode safe handling for missing .properties etc. ----
 function Get-PolicyAssignmentsEvidence {
     param(
         [Parameter(Mandatory=$true)][string]$SubscriptionId,
@@ -129,7 +118,6 @@ function Get-PolicyAssignmentsEvidence {
         elseif ($aksAssignments -isnot [System.Collections.IEnumerable]) { $aksAssignments = @($aksAssignments) }
     } catch { $aksAssignments = @() }
 
-    # Hints for image/registry-related policies (strict-mode safe)
     $imageHint = @()
     foreach ($a in @($subAssignments + $rgAssignments + $aksAssignments)) {
 
@@ -170,12 +158,13 @@ function Get-PolicyAssignmentsEvidence {
     }
 }
 
+# ---- UPDATED: now null-tolerant and not Mandatory ----
 function Extract-ConstraintAssignmentMap {
-    param([Parameter(Mandatory=$true)]$ConstraintsJson)
+    param([Parameter(Mandatory=$false)]$ConstraintsJson)
 
-    # Best-effort: find policyAssignment IDs embedded in constraint annotations
     $map = New-Object System.Collections.Generic.List[object]
-    if (-not $ConstraintsJson -or -not $ConstraintsJson.items) { return $map }
+    if ($null -eq $ConstraintsJson) { return $map }
+    if (-not $ConstraintsJson.items) { return $map }
 
     foreach ($c in $ConstraintsJson.items) {
         $kind = $c.kind
@@ -194,7 +183,6 @@ function Extract-ConstraintAssignmentMap {
 
                     $candidate = @($k,$v) | Where-Object { $_ -match "/providers/Microsoft\.Authorization/policyAssignments/" }
                     foreach ($s in $candidate) {
-                        # PS5.1 safe regex string (single-quoted PowerShell string)
                         $m = [regex]::Match($s, '(/subscriptions/[^ ]+/providers/Microsoft\.Authorization/policyAssignments/[^"'',\s]+)')
                         if ($m.Success) { $assignmentIds += $m.Groups[1].Value }
                     }
@@ -508,7 +496,7 @@ foreach ($sub in $subs) {
         if ($validatingWebhooks -and $validatingWebhooks.items) { $webhookNamesSample += ($validatingWebhooks.items.metadata.name | Select-Object -First 10) }
         if ($mutatingWebhooks -and $mutatingWebhooks.items) { $webhookNamesSample += ($mutatingWebhooks.items.metadata.name | Select-Object -First 10) }
 
-        # Azure Policy ↔ Gatekeeper mapping
+        # Azure Policy ↔ Gatekeeper mapping (NULL SAFE)
         $constraintAssignmentMap = Extract-ConstraintAssignmentMap -ConstraintsJson $constraintsAll
         $mappedConstraints = @($constraintAssignmentMap | Where-Object { $_.AssignmentIds -and $_.AssignmentIds.Count -gt 0 })
 
@@ -555,7 +543,6 @@ foreach ($sub in $subs) {
         $kyverno = Detect-Kyverno -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name
 
         Write-Host "   [5/5] Writing evidence..."
-        # ---- UPDATED: strict-mode safe assignment ID -> display name mapping ----
         $allAssignments = @($policyEvidence.SubscriptionAssignments + $policyEvidence.ResourceGroupAssignments + $policyEvidence.ClusterAssignments)
         $assignmentById = @{}
         foreach ($a in $allAssignments) {
@@ -603,33 +590,19 @@ foreach ($sub in $subs) {
             }
             findings = [PSCustomObject]@{
                 inClusterQueryStatus = $inClusterStatus
-
                 azurePolicyAddonEnabled = $azurePolicyAddonEnabled
                 gatekeeperInstalled     = $gatekeeperInstalled
                 kyvernoInstalled        = $kyverno.Installed
-
                 trustedImageSignals_gatekeeper = ($trustedImageSignals | Select-Object -Unique)
                 acrOnlySignals_gatekeeper      = ($acrOnlyGatekeeperSignals | Select-Object -Unique)
                 acrOnlySignals_kyverno         = ($kyverno.AcrSignals | Select-Object -Unique)
-
                 azurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
                 azurePolicyAssignmentNamesFromConstraints   = ($mappedAssignmentNames | Select-Object -Unique)
-
                 psaEnforcedNamespaces = ($psaEnforcedNamespaces | Select-Object -Unique)
                 psaLevelsObserved     = ($psaLevels | Select-Object -Unique)
-
-                webhookCounts = [PSCustomObject]@{
-                    validating = $validatingWebhookCount
-                    mutating   = $mutatingWebhookCount
-                }
-                constraintCounts = [PSCustomObject]@{
-                    templates   = $constraintTemplateCount
-                    constraints = $constraintsCount
-                }
-                kyvernoCounts = [PSCustomObject]@{
-                    clusterPolicies = $kyverno.ClusterPolicyCount
-                    policies        = $kyverno.PolicyCount
-                }
+                webhookCounts = [PSCustomObject]@{ validating = $validatingWebhookCount; mutating = $mutatingWebhookCount }
+                constraintCounts = [PSCustomObject]@{ templates = $constraintTemplateCount; constraints = $constraintsCount }
+                kyvernoCounts = [PSCustomObject]@{ clusterPolicies = $kyverno.ClusterPolicyCount; policies = $kyverno.PolicyCount }
             }
             evidence = [PSCustomObject]@{
                 arm = [PSCustomObject]@{
@@ -678,48 +651,37 @@ foreach ($sub in $subs) {
             Location                         = $location
             KubernetesVersion                = $k8sVersion
             ClusterResourceId                = $clusterId
-
             PolicyAssignments_SubscriptionCount  = @($policyEvidence.SubscriptionAssignments).Count
             PolicyAssignments_ResourceGroupCount = @($policyEvidence.ResourceGroupAssignments).Count
             PolicyAssignments_ClusterCount       = @($policyEvidence.ClusterAssignments).Count
             PolicyImageTrustAssignmentHints      = (Safe-Join -Items $policyEvidence.ImageTrustAssignmentHints)
-
             AzurePolicyAddonEnabled          = $azurePolicyAddonEnabled
             GatekeeperInstalled              = $gatekeeperInstalled
             GatekeeperPodNamesSample         = (Safe-Join -Items ($gatekeeperPodNames | Select-Object -First 10))
-
             KyvernoInstalled                 = $kyverno.Installed
             KyvernoPodNamesSample            = (Safe-Join -Items $kyverno.PodNamesSample)
             KyvernoClusterPolicyCount        = $kyverno.ClusterPolicyCount
             KyvernoPolicyCount               = $kyverno.PolicyCount
             KyvernoImagePolicyHints          = (Safe-Join -Items $kyverno.ImagePolicyHints)
-
             ValidatingWebhookCount           = $validatingWebhookCount
             MutatingWebhookCount             = $mutatingWebhookCount
             WebhookNamesSample               = (Safe-Join -Items $webhookNamesSample)
-
             ConstraintTemplateCount          = $constraintTemplateCount
             ConstraintsCount                 = $constraintsCount
             ConstraintKinds                  = (Safe-Join -Items $constraintKinds)
-
             TrustedImageConstraintSignals    = (Safe-Join -Items $trustedImageSignals)
             ACR_Only_Signals_Gatekeeper      = (Safe-Join -Items $acrOnlyGatekeeperSignals)
             ACR_Only_Signals_Kyverno         = (Safe-Join -Items $kyverno.AcrSignals)
-
             AzurePolicyConstraintsWithAssignmentIdCount = $mappedConstraints.Count
             AzurePolicyAssignmentNamesFromConstraints   = (Safe-Join -Items ($mappedAssignmentNames | Select-Object -Unique))
-
             PSAEnforcedNamespacesCount       = ($psaEnforcedNamespaces | Select-Object -Unique).Count
             PSALevelsObserved                = (Safe-Join -Items ($psaLevels | Select-Object -Unique))
-
             DefenderPricingTier_KubernetesService = $defenderK8sTier
             DefenderPricingTier_ContainerRegistry = $defenderAcrTier
             DefenderEnabledArmBestEffort          = $defenderEnabledArm
-
             PrivateCluster                   = $privateCluster
             OidcIssuerEnabled                = $oidcEnabled
             WorkloadIdentityEnabled          = $workloadIdentityEnabled
-
             InClusterQueryStatus             = $inClusterStatus
             EvidenceFilePath                 = $evidenceFile
             EvidenceSummaryFilePath          = ""
