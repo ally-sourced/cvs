@@ -7,6 +7,16 @@ Outputs:
   evidence.json (full)
   evidence_summary.json (optional flattened)
 
+Detects:
+- Azure Policy add-on enabled (ARM)
+- Azure Policy assignments at subscription/RG/cluster scopes (ARM)
+- Gatekeeper presence + constraints/templates + webhook configs (in-cluster)
+- Azure Policy ↔ Gatekeeper mapping via constraint annotations containing policyAssignment IDs (best-effort)
+- ACR-only pull patterns (Gatekeeper constraint content + Kyverno content: azurecr.io / *.azurecr.io)
+- PSA enforcement via namespace labels (pod-security.kubernetes.io/enforce)
+- Kyverno presence + ClusterPolicies/Policies + image-related hints (in-cluster)
+- Defender for Cloud pricing tiers (subscription-level; KubernetesService/ContainerRegistry)
+
 Prereqs:
 - az login
 - az cli installed
@@ -86,6 +96,7 @@ function Invoke-AksKubectlJson {
     }
 }
 
+# ---- UPDATED: strict-mode safe handling for missing .properties etc. ----
 function Get-PolicyAssignmentsEvidence {
     param(
         [Parameter(Mandatory=$true)][string]$SubscriptionId,
@@ -100,25 +111,54 @@ function Get-PolicyAssignmentsEvidence {
     $rgAssignments  = @()
     $aksAssignments = @()
 
-    try { $subAssignments = az policy assignment list --scope $SubscriptionScope -o json | ConvertFrom-Json } catch { $subAssignments = @() }
-    try { $rgAssignments  = az policy assignment list --scope $rgScope -o json | ConvertFrom-Json } catch { $rgAssignments  = @() }
-    try { $aksAssignments = az policy assignment list --scope $ClusterResourceId -o json | ConvertFrom-Json } catch { $aksAssignments = @() }
+    try {
+        $subAssignments = az policy assignment list --scope $SubscriptionScope -o json | ConvertFrom-Json
+        if (-not $subAssignments) { $subAssignments = @() }
+        elseif ($subAssignments -isnot [System.Collections.IEnumerable]) { $subAssignments = @($subAssignments) }
+    } catch { $subAssignments = @() }
 
-    # Hints for image/registry-related policies
+    try {
+        $rgAssignments = az policy assignment list --scope $rgScope -o json | ConvertFrom-Json
+        if (-not $rgAssignments) { $rgAssignments = @() }
+        elseif ($rgAssignments -isnot [System.Collections.IEnumerable]) { $rgAssignments = @($rgAssignments) }
+    } catch { $rgAssignments = @() }
+
+    try {
+        $aksAssignments = az policy assignment list --scope $ClusterResourceId -o json | ConvertFrom-Json
+        if (-not $aksAssignments) { $aksAssignments = @() }
+        elseif ($aksAssignments -isnot [System.Collections.IEnumerable]) { $aksAssignments = @($aksAssignments) }
+    } catch { $aksAssignments = @() }
+
+    # Hints for image/registry-related policies (strict-mode safe)
     $imageHint = @()
     foreach ($a in @($subAssignments + $rgAssignments + $aksAssignments)) {
-        $n = $a.properties.displayName
-        $dnId = $a.properties.policyDefinitionId
-        $setId = $a.properties.policySetDefinitionId
+
+        if ($null -eq $a) { continue }
+
+        $displayName = $null
+        $policyDefId = $null
+        $policySetId = $null
+        $fallbackName = $null
+
+        try { $fallbackName = $a.name } catch { $fallbackName = $null }
+
+        $props = $null
+        try { $props = $a.properties } catch { $props = $null }
+
+        if ($props -ne $null) {
+            try { $displayName = $props.displayName } catch { $displayName = $null }
+            try { $policyDefId = $props.policyDefinitionId } catch { $policyDefId = $null }
+            try { $policySetId = $props.policySetDefinitionId } catch { $policySetId = $null }
+        }
 
         $hit = $false
-        if ($n -match 'image|images|registry|registries|ACR|container') { $hit = $true }
-        if ($dnId -match 'image|registry|container') { $hit = $true }
-        if ($setId -match 'image|registry|container') { $hit = $true }
+        if ($displayName -and ($displayName -match 'image|images|registry|registries|ACR|container')) { $hit = $true }
+        if ($policyDefId -and ($policyDefId -match 'image|registry|container')) { $hit = $true }
+        if ($policySetId -and ($policySetId -match 'image|registry|container')) { $hit = $true }
 
         if ($hit) {
-            if (-not [string]::IsNullOrWhiteSpace($n)) { $imageHint += $n }
-            else { $imageHint += $a.name }
+            if (-not [string]::IsNullOrWhiteSpace($displayName)) { $imageHint += $displayName }
+            elseif (-not [string]::IsNullOrWhiteSpace($fallbackName)) { $imageHint += $fallbackName }
         }
     }
 
@@ -515,17 +555,28 @@ foreach ($sub in $subs) {
         $kyverno = Detect-Kyverno -SubscriptionId $subId -ResourceGroup $rg -ClusterName $name
 
         Write-Host "   [5/5] Writing evidence..."
-        # Resolve mapped assignment IDs -> display names
+        # ---- UPDATED: strict-mode safe assignment ID -> display name mapping ----
         $allAssignments = @($policyEvidence.SubscriptionAssignments + $policyEvidence.ResourceGroupAssignments + $policyEvidence.ClusterAssignments)
         $assignmentById = @{}
         foreach ($a in $allAssignments) {
-            if ($a.id) {
-                $display = $a.name
-                if ($a.properties -and $a.properties.displayName -and -not [string]::IsNullOrWhiteSpace($a.properties.displayName)) {
-                    $display = $a.properties.displayName
-                }
-                $assignmentById[$a.id] = $display
+            if ($null -eq $a) { continue }
+
+            $id = $null
+            try { $id = $a.id } catch { $id = $null }
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+            $display = $null
+            try { $display = $a.name } catch { $display = $null }
+
+            $props = $null
+            try { $props = $a.properties } catch { $props = $null }
+            if ($props -ne $null) {
+                $dn = $null
+                try { $dn = $props.displayName } catch { $dn = $null }
+                if (-not [string]::IsNullOrWhiteSpace($dn)) { $display = $dn }
             }
+
+            $assignmentById[$id] = $display
         }
 
         $mappedAssignmentNames = @()
@@ -536,7 +587,6 @@ foreach ($sub in $subs) {
             }
         }
 
-        # Evidence object
         $evidenceObject = [PSCustomObject]@{
             metadata = [PSCustomObject]@{
                 generatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
@@ -620,7 +670,6 @@ foreach ($sub in $subs) {
 
         Write-JsonFile -Path $evidenceFile -Object $evidenceObject
 
-        # CSV row
         $row = [PSCustomObject]@{
             SubscriptionName                 = $subName
             SubscriptionId                   = $subId
@@ -676,7 +725,6 @@ foreach ($sub in $subs) {
             EvidenceSummaryFilePath          = ""
         }
 
-        # Optional summary
         if ($GenerateEvidenceSummary) {
             $summaryObj = Flatten-EvidenceSummary -EvidenceObject $evidenceObject -CsvRow $row
             $summaryObj.evidenceSummaryFilePath = $evidenceSummaryFile
